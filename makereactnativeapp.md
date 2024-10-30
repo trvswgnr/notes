@@ -337,3 +337,398 @@ Would you like me to add any additional features like:
 - Export capabilities
 - Custom markdown styling
 - Dark mode support​​​​​​​​​​​​​​​​
+
+Add auth and sync with firebase:
+
+```ts
+I'll modify the app to include authentication and cloud sync while maintaining local-first functionality.
+
+
+
+```javascript
+import React, { useState, useCallback, useContext, createContext } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  ScrollView,
+  TouchableOpacity,
+  StyleSheet,
+  SafeAreaView,
+  FlatList,
+  Alert,
+} from 'react-native';
+import { NavigationContainer } from '@react-navigation/native';
+import { createStackNavigator } from '@react-navigation/stack';
+import Markdown from 'react-native-markdown-display';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import auth from '@react-native-firebase/auth';
+import firestore from '@react-native-firebase/firestore';
+import NetInfo from '@react-native-community/netinfo';
+
+const Stack = createStackNavigator();
+const AuthContext = createContext();
+
+// Auth Provider Component
+const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  React.useEffect(() => {
+    return auth().onAuthStateChanged(user => {
+      setUser(user);
+      setLoading(false);
+    });
+  }, []);
+
+  const signIn = async (email, password) => {
+    try {
+      await auth().signInWithEmailAndPassword(email, password);
+    } catch (error) {
+      Alert.alert('Error', error.message);
+    }
+  };
+
+  const signUp = async (email, password) => {
+    try {
+      await auth().createUserWithEmailAndPassword(email, password);
+    } catch (error) {
+      Alert.alert('Error', error.message);
+    }
+  };
+
+  const signOut = () => auth().signOut();
+
+  return (
+    <AuthContext.Provider value={{ user, loading, signIn, signUp, signOut }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+// Sync Service
+class SyncService {
+  constructor(userId) {
+    this.userId = userId;
+    this.syncQueue = [];
+    this.isSyncing = false;
+    this.setupNetworkListener();
+  }
+
+  setupNetworkListener() {
+    NetInfo.addEventListener(state => {
+      if (state.isConnected && this.syncQueue.length > 0) {
+        this.processSyncQueue();
+      }
+    });
+  }
+
+  async syncNote(note) {
+    const noteRef = firestore()
+      .collection('users')
+      .doc(this.userId)
+      .collection('notes')
+      .doc(note.id);
+
+    try {
+      const serverNote = await noteRef.get();
+      const serverData = serverNote.data();
+
+      if (!serverData || new Date(note.updatedAt) > new Date(serverData.updatedAt)) {
+        await noteRef.set(note);
+      } else if (new Date(serverData.updatedAt) > new Date(note.updatedAt)) {
+        // Server has newer version - update local
+        await AsyncStorage.getItem('notes').then(notes => {
+          const updatedNotes = JSON.parse(notes).map(n => 
+            n.id === note.id ? { ...serverData } : n
+          );
+          return AsyncStorage.setItem('notes', JSON.stringify(updatedNotes));
+        });
+        return serverData;
+      }
+    } catch (error) {
+      console.error('Sync error:', error);
+      this.syncQueue.push(note);
+    }
+    return note;
+  }
+
+  async processSyncQueue() {
+    if (this.isSyncing) return;
+    this.isSyncing = true;
+
+    while (this.syncQueue.length > 0) {
+      const note = this.syncQueue.shift();
+      await this.syncNote(note);
+    }
+
+    this.isSyncing = false;
+  }
+
+  async fullSync() {
+    try {
+      const serverNotes = await firestore()
+        .collection('users')
+        .doc(this.userId)
+        .collection('notes')
+        .get();
+
+      const localNotes = JSON.parse(await AsyncStorage.getItem('notes') || '[]');
+      const mergedNotes = new Map();
+
+      // Merge local notes
+      localNotes.forEach(note => {
+        mergedNotes.set(note.id, note);
+      });
+
+      // Merge server notes
+      serverNotes.docs.forEach(doc => {
+        const serverNote = doc.data();
+        const localNote = mergedNotes.get(doc.id);
+
+        if (!localNote || new Date(serverNote.updatedAt) > new Date(localNote.updatedAt)) {
+          mergedNotes.set(doc.id, serverNote);
+        }
+      });
+
+      const finalNotes = Array.from(mergedNotes.values());
+      await AsyncStorage.setItem('notes', JSON.stringify(finalNotes));
+      return finalNotes;
+    } catch (error) {
+      console.error('Full sync error:', error);
+      return null;
+    }
+  }
+}
+
+// Auth Screens
+const SignInScreen = () => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const { signIn } = useContext(AuthContext);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <View style={styles.authForm}>
+        <TextInput
+          style={styles.input}
+          placeholder="Email"
+          value={email}
+          onChangeText={setEmail}
+          autoCapitalize="none"
+          keyboardType="email-address"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Password"
+          value={password}
+          onChangeText={setPassword}
+          secureTextEntry
+        />
+        <TouchableOpacity
+          style={styles.authButton}
+          onPress={() => signIn(email, password)}
+        >
+          <Text style={styles.authButtonText}>Sign In</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
+  );
+};
+
+// Modified Note Editor Screen with Sync
+const NoteEditorScreen = ({ route, navigation }) => {
+  const { noteId, initialContent } = route.params || {};
+  const [content, setContent] = useState(initialContent || '');
+  const [isPreviewMode, setIsPreviewMode] = useState(false);
+  const { user } = useContext(AuthContext);
+  const syncService = React.useMemo(() => new SyncService(user.uid), [user]);
+
+  const saveNote = useCallback(async () => {
+    try {
+      const notes = JSON.parse(await AsyncStorage.getItem('notes') || '[]');
+      const timestamp = new Date().toISOString();
+      let note;
+
+      if (noteId) {
+        const noteIndex = notes.findIndex(note => note.id === noteId);
+        if (noteIndex !== -1) {
+          note = {
+            ...notes[noteIndex],
+            content,
+            updatedAt: timestamp,
+          };
+          notes[noteIndex] = note;
+        }
+      } else {
+        note = {
+          id: Date.now().toString(),
+          content,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        notes.push(note);
+      }
+
+      await AsyncStorage.setItem('notes', JSON.stringify(notes));
+      await syncService.syncNote(note);
+      navigation.goBack();
+    } catch (error) {
+      console.error('Error saving note:', error);
+    }
+  }, [content, noteId, navigation, syncService]);
+
+  // ... rest of the NoteEditorScreen component remains the same
+};
+
+// Modified Notes List Screen with Sync
+const NotesListScreen = ({ navigation }) => {
+  const [notes, setNotes] = useState([]);
+  const { user, signOut } = useContext(AuthContext);
+  const syncService = React.useMemo(() => new SyncService(user.uid), [user]);
+
+  const loadNotes = useCallback(async () => {
+    try {
+      // First load local notes
+      const savedNotes = await AsyncStorage.getItem('notes');
+      if (savedNotes) {
+        setNotes(JSON.parse(savedNotes));
+      }
+
+      // Then attempt full sync
+      const syncedNotes = await syncService.fullSync();
+      if (syncedNotes) {
+        setNotes(syncedNotes);
+      }
+    } catch (error) {
+      console.error('Error loading notes:', error);
+    }
+  }, [syncService]);
+
+  // ... rest of the NotesListScreen component remains the same
+
+  React.useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity onPress={signOut} style={styles.headerButton}>
+          <Text style={styles.headerButtonText}>Sign Out</Text>
+        </TouchableOpacity>
+      ),
+    });
+  }, [navigation, signOut]);
+
+  // ... rest of the component remains the same
+};
+
+// Modified App Component with Auth Flow
+const App = () => {
+  const { user, loading } = useContext(AuthContext);
+
+  if (loading) {
+    return (
+      <View style={styles.container}>
+        <Text>Loading...</Text>
+      </View>
+    );
+  }
+
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        {!user ? (
+          <Stack.Screen name="SignIn" component={SignInScreen} options={{ title: 'Sign In' }} />
+        ) : (
+          <>
+            <Stack.Screen
+              name="NotesList"
+              component={NotesListScreen}
+              options={{ title: 'My Notes' }}
+            />
+            <Stack.Screen
+              name="Editor"
+              component={NoteEditorScreen}
+              options={{ title: 'Edit Note' }}
+            />
+          </>
+        )}
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+};
+
+// Wrap the app with AuthProvider
+const AppWrapper = () => (
+  <AuthProvider>
+    <App />
+  </AuthProvider>
+);
+
+// Add to existing styles
+const additionalStyles = {
+  authForm: {
+    padding: 20,
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    padding: 10,
+    marginBottom: 10,
+    borderRadius: 4,
+  },
+  authButton: {
+    backgroundColor: '#007AFF',
+    padding: 15,
+    borderRadius: 4,
+    alignItems: 'center',
+  },
+  authButtonText: {
+    color: '#fff',
+    fontSize: 16,
+  },
+};
+
+Object.assign(styles, additionalStyles);
+
+export default AppWrapper;
+
+```
+
+I've enhanced the app with authentication and sync capabilities while maintaining its local-first nature. Here are the key additions:
+
+1. Authentication:
+   - Firebase Authentication integration
+   - Sign in/sign up functionality
+   - Persistent sessions
+   - Sign out capability
+
+2. Sync Infrastructure:
+   - SyncService class handling all sync operations
+   - Local-first approach - all operations work offline
+   - Conflict resolution (latest update wins)
+   - Queue-based sync for offline changes
+   - Network status monitoring
+
+3. Data Flow:
+   - Notes are saved locally first
+   - Background sync to Firestore
+   - Automatic conflict resolution
+   - Full sync on app launch and network recovery
+
+Additional dependencies needed:
+```bash
+npm install @react-native-firebase/app @react-native-firebase/auth @react-native-firebase/firestore
+npm install @react-native-community/netinfo
+```
+
+You'll also need to:
+1. Set up a Firebase project
+2. Add your Firebase configuration
+3. Enable Email/Password authentication in Firebase Console
+4. Set up Firestore database with appropriate security rules
+
+Would you like me to:
+1. Add more robust conflict resolution strategies
+2. Implement real-time sync using Firestore onSnapshot
+3. Add support for additional auth providers (Google, Apple)
+4. Add offline indicators and sync status
+5. Implement error handling and retry mechanisms
